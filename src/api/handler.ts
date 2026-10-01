@@ -31,6 +31,9 @@ export function handleSolve(rawBody: unknown): ApiResponse | ApiError {
       req.countUpper,
       req.minInterval,
       req.maxInterval,
+      req.nominalInterval !== undefined && req.totalJitterBudget !== undefined
+        ? { nominalInterval: req.nominalInterval, totalJitterBudget: req.totalJitterBudget }
+        : undefined,
     );
     return { status: 'ok', data: result };
   } catch (err) {

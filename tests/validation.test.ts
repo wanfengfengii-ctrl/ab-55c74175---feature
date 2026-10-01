@@ -78,3 +78,74 @@ describe('validateRequest', () => {
     expect(() => validateRequest(b)).toThrow(SolveError);
   });
 });
+
+describe('validateRequest: nominalInterval / totalJitterBudget', () => {
+  it('accepts the pair together and parses both fields', () => {
+    const b = valid();
+    b.nominalInterval = 10;
+    b.totalJitterBudget = 5;
+    const req = validateRequest(b);
+    expect(req.nominalInterval).toBe(10);
+    expect(req.totalJitterBudget).toBe(5);
+  });
+
+  it('leaves both fields undefined when neither is supplied', () => {
+    const req = validateRequest(valid());
+    expect(req.nominalInterval).toBeUndefined();
+    expect(req.totalJitterBudget).toBeUndefined();
+  });
+
+  it('rejects nominalInterval without totalJitterBudget (and vice versa)', () => {
+    const onlyNominal = valid();
+    onlyNominal.nominalInterval = 10;
+    const onlyBudget = valid();
+    onlyBudget.totalJitterBudget = 5;
+    for (const b of [onlyNominal, onlyBudget]) {
+      try {
+        validateRequest(b);
+        throw new Error('should have thrown');
+      } catch (e) {
+        expect((e as SolveError).code).toBe('INVALID_REQUEST');
+      }
+    }
+  });
+
+  it.each([
+    ['below minInterval', 8, 5],
+    ['above maxInterval', 12, 5],
+  ])('rejects nominalInterval %s', (_label, nominal, budget) => {
+    const b = valid();
+    b.nominalInterval = nominal;
+    b.totalJitterBudget = budget;
+    expect(() => validateRequest(b)).toThrow(SolveError);
+  });
+
+  it('accepts nominalInterval exactly on either interval bound', () => {
+    const low = valid();
+    low.nominalInterval = 9;
+    low.totalJitterBudget = 0;
+    expect(validateRequest(low).nominalInterval).toBe(9);
+    const high = valid();
+    high.nominalInterval = 11;
+    high.totalJitterBudget = 0;
+    expect(validateRequest(high).nominalInterval).toBe(11);
+  });
+
+  it('rejects a negative budget and non-integer values', () => {
+    const neg = valid();
+    neg.nominalInterval = 10;
+    neg.totalJitterBudget = -1;
+    expect(() => validateRequest(neg)).toThrow(SolveError);
+    const nonInt = valid();
+    nonInt.nominalInterval = 10;
+    nonInt.totalJitterBudget = 1.5;
+    expect(() => validateRequest(nonInt)).toThrow(SolveError);
+  });
+
+  it('accepts a zero (fully tight) budget', () => {
+    const b = valid();
+    b.nominalInterval = 10;
+    b.totalJitterBudget = 0;
+    expect(validateRequest(b).totalJitterBudget).toBe(0);
+  });
+});

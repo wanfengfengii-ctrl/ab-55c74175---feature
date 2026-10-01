@@ -128,3 +128,117 @@ export function makeRng(start: number): () => number {
     return seed / 2147483648;
   };
 }
+
+export interface RefJitterSolution extends RefSolution {
+  jitter: number;
+}
+
+/**
+ * Exhaustive reference for the cumulative-jitter variant: same search as
+ * bruteSolve but rejects leaves whose total
+ * Σ |(t_{k+1} - t_k) - (c_{k+1} - c_k) * nominalInterval| exceeds the budget.
+ * Independent, deliberately simple logic used for differential testing.
+ */
+export function bruteSolveJitter(
+  packets: PacketInput[],
+  modulus: number,
+  countLower: number,
+  countUpper: number,
+  minInterval: number,
+  maxInterval: number,
+  nominalInterval: number,
+  totalJitterBudget: number,
+): RefJitterSolution | null {
+  const n = packets.length;
+  const mod = (a: number): number => ((a % modulus) + modulus) % modulus;
+  let best: RefJitterSolution | null = null;
+
+  const order: number[] = [];
+  const usedPkt = new Uint8Array(n);
+  const counts = new Array<number>(n);
+  const times = new Array<number>(n);
+
+  const considerLeaf = (): void => {
+    let gapSum = 0;
+    let jitter = 0;
+    for (let k = 1; k < n; k++) {
+      const d = counts[k] - counts[k - 1];
+      gapSum += d;
+      jitter += Math.abs(times[k] - times[k - 1] - d * nominalInterval);
+    }
+    if (jitter > totalJitterBudget) return;
+    let dev = 0;
+    for (let k = 0; k < n; k++) {
+      const p = packets[order[k]];
+      dev += Math.abs(2 * times[k] - (p.timeLower + p.timeUpper));
+    }
+    const cand: RefJitterSolution = {
+      missing: gapSum - (n - 1),
+      deviation: dev,
+      jitter,
+      idSeq: order.map((ix) => packets[ix].id),
+    };
+    if (
+      best === null ||
+      cand.missing < best.missing ||
+      (cand.missing === best.missing &&
+        (cand.deviation < best.deviation ||
+          (cand.deviation === best.deviation && lexIds(cand.idSeq, best.idSeq) < 0)))
+    ) {
+      best = cand;
+    }
+  };
+
+  const chooseTime = (k: number): void => {
+    const pix = order[k];
+    const p = packets[pix];
+    for (let t = p.timeLower; t <= p.timeUpper; t++) {
+      if (k > 0) {
+        const d = counts[k] - counts[k - 1];
+        const g = t - times[k - 1];
+        if (g < d * minInterval || g > d * maxInterval) continue;
+      }
+      times[k] = t;
+      if (k === n - 1) considerLeaf();
+      else chooseTime(k + 1);
+    }
+  };
+
+  const chooseCount = (k: number): void => {
+    if (k === n) {
+      chooseTime(0);
+      return;
+    }
+    const pix = order[k];
+    const p = packets[pix];
+    const from = k === 0 ? countLower : counts[k - 1] + 1;
+    for (let c = from; c <= countUpper; c++) {
+      if (mod(c) !== p.remainder) continue;
+      if (c + (n - 1 - k) > countUpper) break;
+      if (k > 0) {
+        const d = c - counts[k - 1];
+        if (p.timeLower - packets[order[k - 1]].timeUpper > d * maxInterval) continue;
+        if (p.timeUpper - packets[order[k - 1]].timeLower < d * minInterval) continue;
+      }
+      counts[k] = c;
+      chooseCount(k + 1);
+    }
+  };
+
+  const choosePacket = (k: number): void => {
+    if (k === n) {
+      chooseCount(0);
+      return;
+    }
+    for (let i = 0; i < n; i++) {
+      if (usedPkt[i]) continue;
+      usedPkt[i] = 1;
+      order[k] = i;
+      choosePacket(k + 1);
+      usedPkt[i] = 0;
+    }
+  };
+
+  choosePacket(0);
+  return best;
+}

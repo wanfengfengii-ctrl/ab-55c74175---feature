@@ -1,6 +1,7 @@
 import type {
   AdjacencyEvidence,
   AssignedPacket,
+  JitterConfig,
   MissingSegment,
   PacketInput,
   ConstraintFailureEvidence,
@@ -37,12 +38,15 @@ interface PairFeas {
 interface DeadState {
   depth: number;
   placed: number[];
+  gaps: number[];
   last: number;
   S: number;
   c0lo: number;
   c0hi: number;
   tLo: number;
   tHi: number;
+  /** Forced lower bound on prefix jitter at the dead state (budget enabled). */
+  jitterLB: number;
 }
 
 function modNonNeg(a: number, m: number): number {
@@ -235,6 +239,360 @@ export function optimalTimes(
   return { times, deviation2: globalBest };
 }
 
+// ---------------------------------------------------------------------------
+// Cumulative-jitter machinery (optional nominalInterval/totalJitterBudget).
+//
+// For a FIXED order and gap sequence the per-edge jitter is
+// |(t_{e+1} - t_e) - d_e * nominal| and their sum must not exceed the budget.
+// Two exact time solvers are used:
+//   - minChainJitter:       pure minimum total jitter (budget feasibility and
+//                           phase-A pruning), evaluated with two monotone
+//                           sliding-window minima per layer;
+//   - optimalTimesBudgeted: lexicographically smallest timestamp vector that
+//                           minimizes midpoint deviation subject to the jitter
+//                           budget, via Pareto labels.
+//
+// Both rely on a finite candidate set per node containing an optimum of each
+// L1 program: at an integral optimum every variable is pinned through a chain
+// of tight edge constraints, which here may be the sampling lower gap L_e,
+// the upper gap U_e, or the zero-jitter gap N_e = d_e * nominal. Pivots are
+// the interval bounds and the two integers adjacent to each midpoint; the
+// closure propagates them along every tight chain until a fixed point.
+// ---------------------------------------------------------------------------
+
+function jitterCandidates(
+  packets: Packet[],
+  order: number[],
+  windows: { lo: number; hi: number }[],
+  gaps: number[],
+  minInterval: number,
+  maxInterval: number,
+  nominal: number,
+): number[][] {
+  const n = order.length;
+  const L = gaps.map((d) => d * minInterval);
+  const U = gaps.map((d) => d * maxInterval);
+  const N = gaps.map((d) => d * nominal);
+  const sets: Set<number>[] = windows.map(() => new Set<number>());
+  const add = (k: number, v: number): boolean => {
+    if (Number.isSafeInteger(v) && v >= windows[k].lo && v <= windows[k].hi && !sets[k].has(v)) {
+      sets[k].add(v);
+      return true;
+    }
+    return false;
+  };
+  for (let k = 0; k < n; k++) {
+    const p = packets[order[k]];
+    add(k, windows[k].lo);
+    add(k, windows[k].hi);
+    const f = Math.floor(p.mid2 / 2);
+    add(k, f);
+    add(k, p.mid2 % 2 === 0 ? f : f + 1);
+  }
+  // Propagate tight lower / nominal / upper pins both directions. Each pass
+  // at least advances the reach by one edge; chains have at most n-1 edges.
+  for (let sweep = 0; sweep < n; sweep++) {
+    let changed = false;
+    for (let k = 0; k < n - 1; k++) {
+      for (const v of [...sets[k]]) {
+        if (add(k + 1, v + L[k])) changed = true;
+        if (add(k + 1, v + N[k])) changed = true;
+        if (add(k + 1, v + U[k])) changed = true;
+      }
+      for (const v of [...sets[k + 1]]) {
+        if (add(k, v - L[k])) changed = true;
+        if (add(k, v - N[k])) changed = true;
+        if (add(k, v - U[k])) changed = true;
+      }
+    }
+    if (!changed) break;
+  }
+  return sets.map((set) => [...set].sort((a, b) => a - b));
+}
+
+/**
+ * Minimum total jitter tables for a fixed chain.
+ *
+ * suffix[k][c] = minimum sum of edge jitters on edges k..n-2 given
+ * t_k = candidates[k][c]. Recurrence with center c0 = t + N_k:
+ *   f_k(t) = min(  min_{x in [t+L_k, c0]} f_{k+1}(x) + (c0 - x),
+ *                  min_{x in [c0, t+U_k]} f_{k+1}(x) + (x - c0) )
+ * Each branch is a sliding-window minimum with a monotone deque:
+ *   left  (x <= c0): key f_{k+1}(x) - x, window [t + L_k, c0]
+ *   right (x >= c0): key f_{k+1}(x) + x, window [c0, t + U_k].
+ */
+function jitterSuffixTables(
+  candidates: number[][],
+  gaps: number[],
+  minInterval: number,
+  maxInterval: number,
+  nominal: number,
+): number[][] {
+  const n = candidates.length;
+  const L = gaps.map((d) => d * minInterval);
+  const U = gaps.map((d) => d * maxInterval);
+  const N = gaps.map((d) => d * nominal);
+
+  const suffix: number[][] = new Array(n);
+  suffix[n - 1] = new Array(candidates[n - 1].length).fill(0);
+  for (let k = n - 2; k >= 0; k--) {
+    const candsNext = candidates[k + 1];
+    const prev = suffix[k + 1];
+    const gMinus = candsNext.map((x, ix) => (Number.isFinite(prev[ix]) ? prev[ix] - x : Infinity));
+    const gPlus = candsNext.map((x, ix) => (Number.isFinite(prev[ix]) ? prev[ix] + x : Infinity));
+
+    // Both deques advance monotonically while t (hence window bounds) rises.
+    const dequeLo: number[] = [];
+    const dequeHi: number[] = [];
+    let headLo = 0;
+    let headHi = 0;
+    let pushedLo = -1;
+    let pushedHi = -1;
+    const cur = new Array(candidates[k].length).fill(Infinity);
+
+    for (let c = 0; c < candidates[k].length; c++) {
+      const t = candidates[k][c];
+      const center = t + N[k];
+      const low = t + L[k];
+      const high = t + U[k];
+
+      // Left branch window x in [low, min(center, high)].
+      const leftHigh = Math.min(center, high);
+      while (pushedLo + 1 < candsNext.length && candsNext[pushedLo + 1] <= leftHigh) {
+        pushedLo++;
+        if (!Number.isFinite(gMinus[pushedLo])) continue;
+        while (dequeLo.length > headLo && gMinus[dequeLo[dequeLo.length - 1]] >= gMinus[pushedLo]) {
+          dequeLo.pop();
+        }
+        dequeLo.push(pushedLo);
+      }
+      while (headLo < dequeLo.length && candsNext[dequeLo[headLo]] < low) headLo++;
+
+      // Right branch window x in [max(low, center), high].
+      while (pushedHi + 1 < candsNext.length && candsNext[pushedHi + 1] <= high) {
+        pushedHi++;
+        if (!Number.isFinite(gPlus[pushedHi])) continue;
+        while (dequeHi.length > headHi && gPlus[dequeHi[dequeHi.length - 1]] >= gPlus[pushedHi]) {
+          dequeHi.pop();
+        }
+        dequeHi.push(pushedHi);
+      }
+      const rightLow = Math.max(low, center);
+      while (headHi < dequeHi.length && candsNext[dequeHi[headHi]] < rightLow) headHi++;
+
+      let best = Infinity;
+      if (headLo < dequeLo.length) best = Math.min(best, gMinus[dequeLo[headLo]] + center);
+      if (headHi < dequeHi.length) best = Math.min(best, gPlus[dequeHi[headHi]] - center);
+      cur[c] = best;
+    }
+    suffix[k] = cur;
+  }
+  return suffix;
+}
+
+/** Minimum total jitter of a fixed chain; Infinity if no finite assignment. */
+function minChainJitter(
+  candidates: number[][],
+  gaps: number[],
+  minInterval: number,
+  maxInterval: number,
+  nominal: number,
+): number {
+  const suffix = jitterSuffixTables(candidates, gaps, minInterval, maxInterval, nominal);
+  const v = Math.min(...suffix[0]);
+  return Number.isFinite(v) ? v : Infinity;
+}
+
+/**
+ * Lower bound on the jitter of one edge implied by tightened endpoint
+ * windows: distance of the feasible closed time-gap range
+ * [loNext - hiPrev, hiNext - loPrev] intersected with [d*min, d*max] to the
+ * zero-jitter gap d * nominal. Infinity when no gap survives.
+ */
+function edgeJitterLowerBound(
+  d: number,
+  prevLo: number,
+  prevHi: number,
+  nextLo: number,
+  nextHi: number,
+  minInterval: number,
+  maxInterval: number,
+  nominal: number,
+): number {
+  const nGap = d * nominal;
+  const a = Math.max(nextLo - prevHi, d * minInterval);
+  const b = Math.min(nextHi - prevLo, d * maxInterval);
+  if (a > b) return Infinity;
+  return nGap < a ? a - nGap : nGap > b ? nGap - b : 0;
+}
+
+interface BudgetedSolution {
+  times: number[];
+  /** Total midpoint deviation in doubled units. */
+  deviation2: number;
+  /** Total jitter of the returned timestamp vector. */
+  jitter: number;
+}
+
+/** Pareto label: suffix cumulative jitter -> suffix minimum deviation2. */
+interface Label {
+  j: number;
+  d: number;
+}
+
+/** Keep strictly improving points sorted by ascending jitter. */
+function mergeLabels(labels: Label[]): Label[] {
+  if (labels.length === 0) return [];
+  labels.sort((a, b) => a.j - b.j || a.d - b.d);
+  const out: Label[] = [];
+  for (const lab of labels) {
+    if (out.length > 0 && out[out.length - 1].j === lab.j) continue; // smallest d first
+    if (out.length > 0 && out[out.length - 1].d <= lab.d) continue; // dominated
+    out.push(lab);
+  }
+  return out;
+}
+
+/**
+ * Lexicographically smallest integer timestamp vector minimizing the total
+ * midpoint deviation subject to total jitter <= budget for a FIXED chain.
+ * Returns null when no timestamp vector meets the budget.
+ *
+ * Per (position, candidate timestamp) we keep the nondominated Pareto
+ * frontier of (suffix jitter, suffix deviation2); joining adjacent positions
+ * shifts suffix jitter by the chosen edge jitter. Reconstruction greedily
+ * fixes the smallest timestamp that still admits a deviation-optimal,
+ * budget-feasible tail.
+ */
+export function optimalTimesBudgeted(
+  packets: Packet[],
+  order: number[],
+  windows: { lo: number; hi: number }[],
+  gaps: number[],
+  minInterval: number,
+  maxInterval: number,
+  nominal: number,
+  budget: number,
+): BudgetedSolution | null {
+  const n = order.length;
+  const L = gaps.map((d) => d * minInterval);
+  const U = gaps.map((d) => d * maxInterval);
+  const N = gaps.map((d) => d * nominal);
+  const dev = (k: number, t: number): number => Math.abs(2 * t - packets[order[k]].mid2);
+
+  // Shortcut: if the unconstrained deviation optimum already fits the budget,
+  // it is also the deviation optimum under the budget (budget never helps the
+  // deviation objective).
+  const unconstrained = optimalTimes(packets, order, windows, gaps, minInterval, maxInterval);
+  let unconstrainedJitter = 0;
+  for (let k = 0; k < n - 1; k++) {
+    unconstrainedJitter += Math.abs(unconstrained.times[k + 1] - unconstrained.times[k] - N[k]);
+  }
+  if (unconstrainedJitter <= budget) {
+    return { times: unconstrained.times, deviation2: unconstrained.deviation2, jitter: unconstrainedJitter };
+  }
+
+  // The budget binds. Transform to (t_0, δ) with t_k = t_0 + baseN_k + δ_k,
+  // δ_0 = 0. Then edge jitter is |δ_{e+1} - δ_e| (total variation of δ) and
+  // every budget-feasible vector satisfies |δ_k| ≤ budget. At a constrained
+  // optimum t_0 sits at a window/midpoint kink t_0 = pivot_j - baseN_j - δ_j
+  // for some node j with |δ_j| ≤ budget, hence each optimal timestamp
+  //   t_k = t_0 + baseN_k + δ_k
+  // lies within 2·budget of pivot_j - baseN_j + baseN_k for some pivot_j
+  // (interval bound or midpoint-adjacent integer of node j). The union of
+  // those O(n²) integer intervals is a finite spanning set independent of the
+  // timestamp-window width; the Pareto DP below enforces the true edge L/U
+  // bounds and the exact cumulative-jitter ≤ budget constraint.
+  const baseN = new Array<number>(n).fill(0);
+  for (let k = 1; k < n; k++) baseN[k] = baseN[k - 1] + N[k - 1];
+
+  const structuralSets = jitterCandidates(packets, order, windows, gaps, minInterval, maxInterval, nominal);
+  const sets: Set<number>[] = structuralSets.map((s) => new Set(s));
+  const addRange = (i: number, lo: number, hi: number): void => {
+    const a = Math.max(lo, windows[i].lo);
+    const b = Math.min(hi, windows[i].hi);
+    for (let v = a; v <= b; v++) {
+      if (Number.isSafeInteger(v)) sets[i].add(v);
+    }
+  };
+
+  for (let j = 0; j < n; j++) {
+    const p = packets[order[j]];
+    const f = Math.floor(p.mid2 / 2);
+    const c = p.mid2 % 2 === 0 ? f : f + 1;
+    for (const pivot of [windows[j].lo, windows[j].hi, f, c]) {
+      const projected = pivot - baseN[j];
+      for (let k = 0; k < n; k++) {
+        addRange(k, projected + baseN[k] - 2 * budget, projected + baseN[k] + 2 * budget);
+      }
+    }
+  }
+  const candidates = sets.map((set) => [...set].sort((a, b) => a - b));
+  // front[k][c] = Pareto labels for positions k..n-1 given t_k = cand, using
+  // jitter on edges k..n-2 and deviation on nodes k..n-1.
+  const front: Label[][][] = new Array(n);
+  front[n - 1] = candidates[n - 1].map((t) => [{ j: 0, d: dev(n - 1, t) }]);
+  for (let k = n - 2; k >= 0; k--) {
+    front[k] = candidates[k].map((t) => {
+      const gathered: Label[] = [];
+      for (let ix = 0; ix < candidates[k + 1].length; ix++) {
+        const x = candidates[k + 1][ix];
+        const dt = x - t;
+        if (dt < L[k] || dt > U[k]) continue;
+        const edge = Math.abs(dt - N[k]);
+        for (const lab of front[k + 1][ix]) {
+          const j = lab.j + edge;
+          if (j <= budget) gathered.push({ j, d: lab.d });
+        }
+      }
+      const dk = dev(k, t);
+      return mergeLabels(gathered).map((lab) => ({ j: lab.j, d: lab.d + dk }));
+    });
+  }
+
+  let Dstar = Infinity;
+  for (const labels of front[0]) {
+    for (const lab of labels) if (lab.d < Dstar) Dstar = lab.d;
+  }
+  if (!Number.isFinite(Dstar)) return null;
+
+  const times = new Array<number>(n);
+  let remDev = Dstar;
+  let remBudget = budget;
+  let prevTime = Number.NaN;
+  for (let k = 0; k < n; k++) {
+    let chosenT = Number.NaN;
+    let chosenLabel: Label | null = null;
+    for (let c = 0; c < candidates[k].length; c++) {
+      const t = candidates[k][c];
+      let edge = 0;
+      if (k > 0) {
+        const dt = t - prevTime;
+        if (dt < L[k - 1] || dt > U[k - 1]) continue;
+        edge = Math.abs(dt - N[k - 1]);
+      }
+      for (const lab of front[k][c]) {
+        if (lab.d !== remDev) continue;
+        if (lab.j <= remBudget - edge) {
+          chosenT = t;
+          chosenLabel = lab;
+          break;
+        }
+      }
+      if (chosenLabel) break;
+    }
+    if (chosenLabel === null) return null; // defensive
+    times[k] = chosenT;
+    if (k > 0) remBudget -= Math.abs(chosenT - prevTime - N[k - 1]);
+    remDev -= dev(k, chosenT);
+    prevTime = chosenT;
+  }
+
+  let jitter = 0;
+  for (let k = 0; k < n - 1; k++) jitter += Math.abs(times[k + 1] - times[k] - N[k]);
+  return { times, deviation2: Dstar, jitter };
+}
+
 interface Move {
   j: number;
   d: number;
@@ -272,9 +630,13 @@ export function solve(
   countUpper: number,
   minInterval: number,
   maxInterval: number,
+  jitter?: JitterConfig,
 ): SolveResult {
   const n = inputs.length;
   const W = countUpper - countLower;
+  const jc = jitter;
+  const nominal = jc?.nominalInterval;
+  const jitterBudget = jc?.totalJitterBudget ?? Infinity;
 
   // Group identical (remainder, lo, hi) packets for symmetry breaking.
   const groups = new Map<string, number[]>();
@@ -395,6 +757,43 @@ export function solve(
     return bits;
   };
 
+  /**
+   * Exact prefix signature: full packet sequence, fixed gaps and the
+   * forward-tightened per-position windows. When the jitter budget is enabled
+   * two paths sharing only the search frontier are not interchangeable
+   * (prefix jitter consumption differs), so the phase-A/oracle memos must key
+   * on the complete prefix instead of just (mask, last, frontier).
+   */
+  const prefixKey = (
+    tag: string,
+    depth: number,
+    last: number,
+    S: number,
+    c0lo: number,
+    c0hi: number,
+    tLo: number,
+    tHi: number,
+  ): string => {
+    let s = `${tag}|${depth}|${last}|${S}|${c0lo}|${c0hi}|${tLo}|${tHi}`;
+    for (let k = 0; k < depth; k++) {
+      s += `>${orderArr[k]}:${k > 0 ? gapsArr[k - 1] : 0}:${tLoArr[k]},${tHiArr[k]}`;
+    }
+    return s;
+  };
+
+  /**
+   * Lower bound on the jitter of one edge implied by tightened endpoint
+   * windows; thin closure over the request's interval parameters.
+   */
+  const edgeJitterLB = (
+    d: number,
+    prevLo: number,
+    prevHi: number,
+    nextLo: number,
+    nextHi: number,
+  ): number =>
+    edgeJitterLowerBound(d, prevLo, prevHi, nextLo, nextHi, minInterval, maxInterval, nominal!);
+
   /** Symmetry leader: within a twin group only the smallest-ranked still
    * unused member may be picked next. Relabeling identical twins never
    * changes the objectives, and the lex-min order always consumes them in
@@ -412,7 +811,10 @@ export function solve(
   };
 
   /** Successors in canonical order: every congruent feasible gap per target,
-   * sorted by smallest gap then smallest target id. */
+   * sorted by smallest gap then smallest target id. When the jitter budget is
+   * enabled, gaps whose edge alone forces the cumulative lower bound past the
+   * budget are dropped; pass jlbLB = Infinity to enumerate without the filter
+   * (used for first-blocker evidence). */
   const enumerateMoves = (
     depth: number,
     last: number,
@@ -422,6 +824,7 @@ export function solve(
     tLo: number,
     tHi: number,
     mask: number,
+    jlb = Infinity,
   ): Move[] => {
     const slotsAfter = n - 1 - depth;
     const moves: Move[] = [];
@@ -451,6 +854,10 @@ export function solve(
         const ntLo = Math.max(pj.lo, tLo + d * minInterval);
         const ntHi = Math.min(pj.hi, tHi + d * maxInterval);
         if (njLo > njHi || ntLo > ntHi) return null;
+        if (jc !== undefined) {
+          const forced = edgeJitterLB(d, tLo, tHi, ntLo, ntHi);
+          if (jlb + forced > jitterBudget) return null;
+        }
         return { j, d, c0lo: njLo, c0hi: njHi, tLo: ntLo, tHi: ntHi };
       };
 
@@ -474,10 +881,44 @@ export function solve(
     c0hi: number,
     tLo: number,
     tHi: number,
+    jlb = Infinity,
   ): void => {
     if (bestDead === null || depth > bestDead.depth) {
-      bestDead = { depth, placed: orderArr.slice(0, depth), last, S, c0lo, c0hi, tLo, tHi };
+      bestDead = {
+        depth,
+        placed: orderArr.slice(0, depth),
+        gaps: gapsArr.slice(0, Math.max(0, depth - 1)),
+        last,
+        S,
+        c0lo,
+        c0hi,
+        tLo,
+        tHi,
+        jitterLB: jc !== undefined ? jlb : Infinity,
+      };
     }
+  };
+
+  /** Exact fixed-chain budget test for the complete order in the shared
+   * arrays (orderArr[0..depth-1], gapsArr[0..depth-2]). Returns the minimum
+   * total jitter, or Infinity when the chain is infeasible / over budget. */
+  const chainMinJitter = (depth: number): number => {
+    if (jc === undefined) return 0;
+    const order = orderArr.slice(0, depth);
+    const gaps = gapsArr.slice(0, depth - 1);
+    const windows = tightenWindows(packets, order, gaps, minInterval, maxInterval);
+    if (windows === null) return Infinity;
+    const cands = jitterCandidates(
+      packets,
+      order,
+      windows,
+      gaps,
+      minInterval,
+      maxInterval,
+      jc.nominalInterval,
+    );
+    const v = minChainJitter(cands, gaps, minInterval, maxInterval, jc.nominalInterval);
+    return v <= jc.totalJitterBudget ? v : Infinity;
   };
 
   // ------------------------------------------------------------------ Phase A
@@ -488,9 +929,14 @@ export function solve(
   let bestA = Infinity;
   let stopA = false;
 
-  const dfsA = (depth: number, last: number, S: number, c0lo: number, c0hi: number, tLo: number, tHi: number): number => {
+  const dfsA = (depth: number, last: number, S: number, c0lo: number, c0hi: number, tLo: number, tHi: number, jlb = 0): number => {
     if (stopA) return Infinity;
     if (depth === n) {
+      const jm = chainMinJitter(depth);
+      if (!Number.isFinite(jm)) {
+        recordDead(depth, last, S, c0lo, c0hi, tLo, tHi, jlb);
+        return Infinity;
+      }
       if (S < bestA) bestA = S;
       if (bestA === globalPrimaryLB) stopA = true;
       return S;
@@ -502,13 +948,18 @@ export function solve(
     // deepest non-extendable state for failure evidence.
     if (Number.isFinite(bestA) && S + cont[remaining][last] >= bestA) return Infinity;
 
-    const key = `A|${mask}|${last}|${S}|${c0lo}|${c0hi}|${tLo}|${tHi}`;
+    // With the jitter budget enabled, prefixes with different accumulated
+    // jitter are not interchangeable; key on the complete prefix.
+    const key =
+      jc === undefined
+        ? `A|${mask}|${last}|${S}|${c0lo}|${c0hi}|${tLo}|${tHi}`
+        : prefixKey('A', depth, last, S, c0lo, c0hi, tLo, tHi);
     const cached = memoA.get(key);
     if (cached !== undefined) return cached;
 
-    const moves = enumerateMoves(depth, last, S, c0lo, c0hi, tLo, tHi, mask);
+    const moves = enumerateMoves(depth, last, S, c0lo, c0hi, tLo, tHi, mask, jlb);
     if (moves.length === 0) {
-      recordDead(depth, last, S, c0lo, c0hi, tLo, tHi);
+      recordDead(depth, last, S, c0lo, c0hi, tLo, tHi, jlb);
       memoA.set(key, Infinity);
       return Infinity;
     }
@@ -521,13 +972,17 @@ export function solve(
       gapsArr[depth - 1] = mv.d;
       tLoArr[depth] = mv.tLo;
       tHiArr[depth] = mv.tHi;
-      const v = dfsA(depth + 1, mv.j, S + mv.d, mv.c0lo, mv.c0hi, mv.tLo, mv.tHi);
+      const childJlb =
+        jc === undefined
+          ? 0
+          : jlb + edgeJitterLB(mv.d, tLo, tHi, mv.tLo, mv.tHi);
+      const v = dfsA(depth + 1, mv.j, S + mv.d, mv.c0lo, mv.c0hi, mv.tLo, mv.tHi, childJlb);
       used[mv.j] = 0;
       if (v < best) best = v;
       if (stopA) break;
     }
     if (best === Infinity) {
-      recordDead(depth, last, S, c0lo, c0hi, tLo, tHi);
+      recordDead(depth, last, S, c0lo, c0hi, tLo, tHi, jlb);
     }
     memoA.set(key, best);
     return best;
@@ -544,72 +999,124 @@ export function solve(
     dfsA(1, seed.index, 0, seed.baseCount, c0hi0, seed.lo, seed.hi);
   }
   if (bestA === Infinity) {
-    throw buildFailureEvidence(packets, pair, bestDead, modulus, countUpper, minInterval, maxInterval);
+    throw buildFailureEvidence(packets, pair, bestDead, modulus, countUpper, minInterval, maxInterval, jc);
   }
   const Pstar = bestA;
 
-  // ------------------------------------------------------------- Phase B/C key
-  // Deviation-relevant state also records the per-position tightened windows
-  // AND interval identities (midpoint sequence), since converging paths with
-  // different packet types at prefix positions are not interchangeable.
-  /** Exact state signature for the deviation/lex phases: full prefix packet
-   * sequence, its gaps and every position's tightened window. Paths sharing
-   * this signature have identical prefix deviation and an identical frontier,
-   * so memoized results are interchangeable. */
-  const stateKeyBC = (depth: number, last: number, S: number, c0lo: number, c0hi: number, tLo: number, tHi: number): string => {
-    let s = `${depth}|${last}|${S}|${c0lo}|${c0hi}|${tLo}|${tHi}`;
-    for (let k = 0; k < depth; k++) {
-      s += `>${orderArr[k]}:${k > 0 ? gapsArr[k - 1] : 0}:${tLoArr[k]},${tHiArr[k]}`;
-    }
+  // ------------------------------------------------------- Phase B/C: prefix
+  // The deviation and lexicographic phases (and the primary-optimal oracle
+  // they share) carry the fixed partial order as an IMMUTABLE prefix of
+  // nodes instead of mutating the shared search arrays. This keeps memoized
+  // states self-contained — essential when the jitter budget is enabled,
+  // because two frontiers reached through different prefixes consume
+  // different amounts of jitter and are never interchangeable.
+  interface PNode {
+    j: number;
+    /** Counter gap into this node (0 for the seed). */
+    d: number;
+    c0lo: number;
+    c0hi: number;
+    tLo: number;
+    tHi: number;
+  }
+
+  const seedNode = (seedIndex: number): PNode => {
+    const seed = packets[seedIndex];
+    return {
+      j: seedIndex,
+      d: 0,
+      c0lo: seed.baseCount,
+      c0hi: Math.min(seed.topCount, countUpper - n + 1),
+      tLo: seed.lo,
+      tHi: seed.hi,
+    };
+  };
+
+  const nodeMask = (nodes: PNode[]): number => {
+    let mask = 0;
+    for (const nd of nodes) mask |= 1 << nd.j;
+    return mask;
+  };
+
+  const nodeKey = (tag: string, nodes: PNode[], S: number): string => {
+    let s = `${tag}|${S}`;
+    for (const nd of nodes) s += `>${nd.j}:${nd.d}:${nd.tLo},${nd.tHi}:${nd.c0lo},${nd.c0hi}`;
     return s;
   };
 
+  /** Forced lower bound on jitter already consumed by the fixed prefix. */
+  const nodesJitterLB = (nodes: PNode[]): number => {
+    let sum = 0;
+    for (let k = 1; k < nodes.length; k++) {
+      const a = nodes[k - 1];
+      const b = nodes[k];
+      const v = edgeJitterLB(b.d, a.tLo, a.tHi, b.tLo, b.tHi);
+      if (!Number.isFinite(v)) return Infinity;
+      sum += v;
+    }
+    return sum;
+  };
+
+  /** Exact minimum total jitter of a complete prefix; Infinity if over budget
+   * or (defensively) structurally infeasible. */
+  const chainJitterOf = (nodes: PNode[]): number => {
+    if (jc === undefined) return 0;
+    const order = nodes.map((nd) => nd.j);
+    const gaps = nodes.slice(1).map((nd) => nd.d);
+    const windows = tightenWindows(packets, order, gaps, minInterval, maxInterval);
+    if (windows === null) return Infinity;
+    const cands = jitterCandidates(
+      packets, order, windows, gaps, minInterval, maxInterval, jc.nominalInterval,
+    );
+    const v = minChainJitter(cands, gaps, minInterval, maxInterval, jc.nominalInterval);
+    return v <= jc.totalJitterBudget ? v : Infinity;
+  };
+
+  /** Optimal midpoint deviation2 of a complete prefix under the jitter budget. */
+  const deviationOf = (nodes: PNode[]): number => {
+    const order = nodes.map((nd) => nd.j);
+    const gaps = nodes.slice(1).map((nd) => nd.d);
+    const windows = tightenWindows(packets, order, gaps, minInterval, maxInterval);
+    if (windows === null) return Infinity;
+    if (jc === undefined) {
+      return optimalTimes(packets, order, windows, gaps, minInterval, maxInterval).deviation2;
+    }
+    const sol = optimalTimesBudgeted(
+      packets, order, windows, gaps, minInterval, maxInterval,
+      jc.nominalInterval, jc.totalJitterBudget,
+    );
+    return sol === null ? Infinity : sol.deviation2;
+  };
+
   /**
-   * Exact primary-optimal-chain oracle. Returns true exactly when a
-   * completion of the CURRENT state reaches total gap Pstar. Unlike the
-   * intrinsic Held-Karp bound, this accounts for time/count feasibility, so
-   * it is the correct filter for the deviation and lexicographic phases.
-   *
-   * The state is Markovian in (used mask, last packet, fixed gap sum S,
-   * tightened c0 window and last timestamp window): difference constraints on
-   * an ordered chain mean earlier prefix positions influence the future only
-   * through the last packet's tightened window.
+   * Primary-optimal-chain oracle: true exactly when the given prefix admits a
+   * completion reaching total gap Pstar (and, when enabled, the jitter
+   * budget). The Held-Karp table provides a necessary exact gap bound;
+   * time/count feasibility is checked by enumeration and the cumulative
+   * jitter by the fixed-chain solver at the leaf.
    */
   const memoOpt = new Map<string, boolean>();
-  const optimalFromState = (
-    depth: number,
-    last: number,
-    S: number,
-    c0lo: number,
-    c0hi: number,
-    tLo: number,
-    tHi: number,
-    mask: number,
-  ): boolean => {
-    if (depth === n) return S === Pstar;
-    const key = `O|${mask}|${last}|${S}|${c0lo}|${c0hi}|${tLo}|${tHi}`;
+  const oracle = (nodes: PNode[], S: number): boolean => {
+    const depth = nodes.length;
+    if (depth === n) return S === Pstar && Number.isFinite(chainJitterOf(nodes));
+    const key = jc === undefined ? nodeKey('O', nodes, S) : nodeKey('O', nodes, S);
     const cached = memoOpt.get(key);
     if (cached !== undefined) return cached;
 
+    const last = nodes[depth - 1];
+    const mask = nodeMask(nodes);
     const remaining = full ^ mask;
-    const moves = enumerateMoves(depth, last, S, c0lo, c0hi, tLo, tHi, mask);
+    const jlb = jc === undefined ? 0 : nodesJitterLB(nodes);
+    const moves = enumerateMoves(
+      depth, last.j, S, last.c0lo, last.c0hi, last.tLo, last.tHi, mask, jlb,
+    );
     let ok = false;
     for (const mv of moves) {
-      // Necessary bound for reaching Pstar; exact feasibility checked below.
       if (S + mv.d + cont[remaining ^ (1 << mv.j)][mv.j] > Pstar) continue;
-      used[mv.j] = 1;
-      const v = optimalFromState(
-        depth + 1,
-        mv.j,
-        S + mv.d,
-        mv.c0lo,
-        mv.c0hi,
-        mv.tLo,
-        mv.tHi,
-        mask | (1 << mv.j),
-      );
-      used[mv.j] = 0;
-      if (v) {
+      const child: PNode = {
+        j: mv.j, d: mv.d, c0lo: mv.c0lo, c0hi: mv.c0hi, tLo: mv.tLo, tHi: mv.tHi,
+      };
+      if (oracle([...nodes, child], S + mv.d)) {
         ok = true;
         break;
       }
@@ -618,52 +1125,33 @@ export function solve(
     return ok;
   };
 
-  /** Successor moves that lie on at least one primary-optimal completion. */
-  const optimalMoves = (
-    depth: number,
-    last: number,
-    S: number,
-    c0lo: number,
-    c0hi: number,
-    tLo: number,
-    tHi: number,
-    mask: number,
-  ): Move[] => {
+  /** Moves from a prefix that lie on at least one primary-optimal completion. */
+  const optimalMovesFrom = (nodes: PNode[], S: number): Move[] => {
+    const depth = nodes.length;
+    const last = nodes[depth - 1];
+    const mask = nodeMask(nodes);
     const remaining = full ^ mask;
-    const all = enumerateMoves(depth, last, S, c0lo, c0hi, tLo, tHi, mask);
+    const jlb = jc === undefined ? 0 : nodesJitterLB(nodes);
+    const all = enumerateMoves(
+      depth, last.j, S, last.c0lo, last.c0hi, last.tLo, last.tHi, mask, jlb,
+    );
     return all.filter((mv) => {
       if (S + mv.d + cont[remaining ^ (1 << mv.j)][mv.j] > Pstar) return false;
-      return optimalFromState(
-        depth + 1,
-        mv.j,
-        S + mv.d,
-        mv.c0lo,
-        mv.c0hi,
-        mv.tLo,
-        mv.tHi,
-        mask | (1 << mv.j),
-      );
+      const child: PNode = {
+        j: mv.j, d: mv.d, c0lo: mv.c0lo, c0hi: mv.c0hi, tLo: mv.tLo, tHi: mv.tHi,
+      };
+      return oracle([...nodes, child], S + mv.d);
     });
   };
 
-  /** Whether a seed packet can begin any primary-optimal completion. */
   const seedIsOptimal = (seedIndex: number): boolean => {
-    const seed = packets[seedIndex];
-    const c0hi0 = Math.min(seed.topCount, countUpper - n + 1);
-    if (seed.baseCount > c0hi0) return false;
-    return optimalFromState(1, seedIndex, 0, seed.baseCount, c0hi0, seed.lo, seed.hi, 1 << seedIndex);
-  };
-
-  const leafDeviation = (): number => {
-    const order = orderArr.slice();
-    const gaps = gapsArr.slice();
-    const windows = tightenWindows(packets, order, gaps, minInterval, maxInterval);
-    if (windows === null) return Infinity;
-    return optimalTimes(packets, order, windows, gaps, minInterval, maxInterval).deviation2;
+    const node = seedNode(seedIndex);
+    if (node.c0lo > node.c0hi) return false;
+    return oracle([node], 0);
   };
 
   // ------------------------------------------------------------------ Phase B
-  // Minimum total deviation2 over primary-optimal chains.
+  // Minimum deviation2 over primary-optimal, budget-feasible chains.
   const memoB = new Map<string, number>();
   let bestB = Infinity;
 
@@ -676,34 +1164,31 @@ export function solve(
     return sum;
   };
 
-  const dfsB = (depth: number, last: number, S: number, c0lo: number, c0hi: number, tLo: number, tHi: number): number => {
+  const dfsB = (nodes: PNode[], S: number): number => {
+    const depth = nodes.length;
     if (depth === n) {
-      const v = leafDeviation();
+      const v = deviationOf(nodes);
       if (v < bestB) bestB = v;
       return v;
     }
-    const mask = usedMask();
+    const mask = nodeMask(nodes);
 
     let placedLB = 0;
-    for (let k = 0; k < depth; k++) {
-      placedLB += minDeviation2(tLoArr[k], tHiArr[k], packets[orderArr[k]].mid2);
+    for (const nd of nodes) {
+      placedLB += minDeviation2(nd.tLo, nd.tHi, packets[nd.j].mid2);
     }
     if (placedLB + independentDevLB(mask) >= bestB) return Infinity;
 
-    const key = stateKeyBC(depth, last, S, c0lo, c0hi, tLo, tHi);
+    const key = nodeKey('B', nodes, S);
     const cached = memoB.get(key);
     if (cached !== undefined) return cached;
 
-    const moves = optimalMoves(depth, last, S, c0lo, c0hi, tLo, tHi, mask);
     let best = Infinity;
-    for (const mv of moves) {
-      used[mv.j] = 1;
-      orderArr[depth] = mv.j;
-      gapsArr[depth - 1] = mv.d;
-      tLoArr[depth] = mv.tLo;
-      tHiArr[depth] = mv.tHi;
-      const v = dfsB(depth + 1, mv.j, S + mv.d, mv.c0lo, mv.c0hi, mv.tLo, mv.tHi);
-      used[mv.j] = 0;
+    for (const mv of optimalMovesFrom(nodes, S)) {
+      const child: PNode = {
+        j: mv.j, d: mv.d, c0lo: mv.c0lo, c0hi: mv.c0hi, tLo: mv.tLo, tHi: mv.tHi,
+      };
+      const v = dfsB([...nodes, child], S + mv.d);
       if (v < best) best = v;
     }
     memoB.set(key, best);
@@ -712,13 +1197,7 @@ export function solve(
 
   for (const seed of seedOrder) {
     if (!seedIsOptimal(seed.index)) continue;
-    const c0hi0 = Math.min(seed.topCount, countUpper - n + 1);
-    used.fill(0);
-    used[seed.index] = 1;
-    orderArr[0] = seed.index;
-    tLoArr[0] = seed.lo;
-    tHiArr[0] = seed.hi;
-    dfsB(1, seed.index, 0, seed.baseCount, c0hi0, seed.lo, seed.hi);
+    dfsB([seedNode(seed.index)], 0);
   }
   if (bestB === Infinity) {
     // Defensive: phase A guarantees a primary-optimal feasible leaf.
@@ -730,148 +1209,93 @@ export function solve(
   const Dstar = bestB;
 
   // ------------------------------------------------------------------ Phase C
-  // Greedily construct the lexicographically smallest id sequence. At every
-  // position candidate packets are tried in ascending id order; a memoized
-  // boolean oracle decides whether a primary-optimal, deviation-optimal
-  // completion exists with the candidate fixed at the current position.
+  // Greedily fix the lexicographically smallest id sequence using a memoized
+  // boolean oracle over immutable prefixes.
   const memoC = new Map<string, boolean>();
-
-  const dfsCfeasible = (depth: number, last: number, S: number, c0lo: number, c0hi: number, tLo: number, tHi: number): boolean => {
-    if (depth === n) {
-      return leafDeviation() === Dstar;
-    }
-    const mask = usedMask();
-    const key = stateKeyBC(depth, last, S, c0lo, c0hi, tLo, tHi);
+  const feasibleWithDstar = (nodes: PNode[], S: number): boolean => {
+    if (nodes.length === n) return deviationOf(nodes) === Dstar;
+    const key = nodeKey('C', nodes, S);
     const cached = memoC.get(key);
     if (cached !== undefined) return cached;
-
-    const moves = optimalMoves(depth, last, S, c0lo, c0hi, tLo, tHi, mask);
     let ok = false;
-    for (const mv of moves) {
-      used[mv.j] = 1;
-      orderArr[depth] = mv.j;
-      gapsArr[depth - 1] = mv.d;
-      tLoArr[depth] = mv.tLo;
-      tHiArr[depth] = mv.tHi;
-      ok = dfsCfeasible(depth + 1, mv.j, S + mv.d, mv.c0lo, mv.c0hi, mv.tLo, mv.tHi);
-      used[mv.j] =0;
-      if (ok) break;
+    for (const mv of optimalMovesFrom(nodes, S)) {
+      const child: PNode = {
+        j: mv.j, d: mv.d, c0lo: mv.c0lo, c0hi: mv.c0hi, tLo: mv.tLo, tHi: mv.tHi,
+      };
+      if (feasibleWithDstar([...nodes, child], S + mv.d)) {
+        ok = true;
+        break;
+      }
     }
     memoC.set(key, ok);
     return ok;
   };
 
-  const chosen: number[] = [];
-  const fixedGaps: number[] = [];
-  let curLast = -1;
-  let curS = 0;
-  let curC0lo = 0;
-  let curC0hi = 0;
-  let curTLo = 0;
-  let curTHi = 0;
-  let curMask = 0;
-
-  /** Reproduce the forward-tightened windows of the fixed prefix so the
-   * oracle's memoization keys and leaf tightening see a consistent state. */
-  const replayPrefixWindows = (): void => {
-    for (let k = 0; k < chosen.length; k++) {
-      const p = packets[chosen[k]];
-      if (k === 0) {
-        tLoArr[0] = p.lo;
-        tHiArr[0] = p.hi;
-      } else {
-        const d = fixedGaps[k - 1];
-        tLoArr[k] = Math.max(p.lo, tLoArr[k - 1] + d * minInterval);
-        tHiArr[k] = Math.min(p.hi, tHiArr[k - 1] + d * maxInterval);
-      }
-      orderArr[k] = chosen[k];
-      if (k > 0) gapsArr[k - 1] = fixedGaps[k - 1];
-    }
-  };
-
+  const fixedNodes: PNode[] = [];
+  let fixedS = 0;
   for (let depth = 0; depth < n; depth++) {
-    let candidates: { j: number; mv: Move | null }[];
+    let candidates: PNode[];
     if (depth === 0) {
-      candidates = seedOrder
-        .filter((p) => seedIsOptimal(p.index))
-        .map((p) => ({ j: p.index, mv: null }));
+      candidates = seedOrder.filter((p) => seedIsOptimal(p.index)).map((p) => seedNode(p.index));
     } else {
-      candidates = optimalMoves(depth, curLast, curS, curC0lo, curC0hi, curTLo, curTHi, curMask).map(
-        (mv) => ({ j: mv.j, mv }),
-      );
+      candidates = optimalMovesFrom(fixedNodes, fixedS).map((mv) => ({
+        j: mv.j, d: mv.d, c0lo: mv.c0lo, c0hi: mv.c0hi, tLo: mv.tLo, tHi: mv.tHi,
+      }));
     }
     candidates.sort((a, b) => compareId(packets[a.j].id, packets[b.j].id));
 
-    let picked: { j: number; mv: Move | null } | null = null;
+    let picked: PNode | null = null;
     for (const cand of candidates) {
-      const j = cand.j;
-      used.fill(0);
-      for (const ix of chosen) used[ix] = 1;
-      used[j] = 1;
-      replayPrefixWindows();
-      orderArr[depth] = j;
-
-      let ok: boolean;
-      if (depth === 0) {
-        const seed = packets[j];
-        const c0hi0 = Math.min(seed.topCount, countUpper - n + 1);
-        tLoArr[0] = seed.lo;
-        tHiArr[0] = seed.hi;
-        ok = dfsCfeasible(1, j, 0, seed.baseCount, c0hi0, seed.lo, seed.hi);
-      } else {
-        const mv = cand.mv!;
-        gapsArr[depth - 1] = mv.d;
-        tLoArr[depth] = mv.tLo;
-        tHiArr[depth] = mv.tHi;
-        ok = dfsCfeasible(depth + 1, j, curS + mv.d, mv.c0lo, mv.c0hi, mv.tLo, mv.tHi);
-      }
-      used[j] = 0;
-      if (ok) {
+      const nextS = depth === 0 ? 0 : fixedS + cand.d;
+      if (feasibleWithDstar([...fixedNodes, cand], nextS)) {
         picked = cand;
         break;
       }
     }
-
-    if (!picked) {
+    if (picked === null) {
       // Defensive: phases A/B certify a feasible choice at every position.
       throw new SolveError('NO_CONSISTENT_INTERPRETATION', 'internal failure reconstructing lex-min order');
     }
-
-    chosen.push(picked.j);
-    if (depth === 0) {
-      const seed = packets[picked.j];
-      curC0lo = seed.baseCount;
-      curC0hi = Math.min(seed.topCount, countUpper - n + 1);
-      curTLo = seed.lo;
-      curTHi = seed.hi;
-    } else {
-      const mv = picked.mv!;
-      fixedGaps.push(mv.d);
-      curS += mv.d;
-      curC0lo = mv.c0lo;
-      curC0hi = mv.c0hi;
-      curTLo = mv.tLo;
-      curTHi = mv.tHi;
-    }
-    curLast = picked.j;
-    curMask |= 1 << picked.j;
+    fixedNodes.push(picked);
+    fixedS = depth === 0 ? 0 : fixedS + picked.d;
   }
 
   // Assemble the certified solution: smallest admissible c0, optimal times.
-  const finalOrder = chosen.slice();
-  const finalGaps = fixedGaps.slice();
+  const finalOrder = fixedNodes.map((nd) => nd.j);
+  const finalGaps = fixedNodes.slice(1).map((nd) => nd.d);
+  const finalC0 = fixedNodes[0].c0lo;
   const windows = tightenWindows(packets, finalOrder, finalGaps, minInterval, maxInterval);
   if (!windows) {
     throw new SolveError('NO_CONSISTENT_INTERPRETATION', 'internal failure tightening final windows');
   }
-  const { times, deviation2: dev2 } = optimalTimes(
-    packets,
-    finalOrder,
-    windows,
-    finalGaps,
-    minInterval,
-    maxInterval,
-  );
+  let finalTimes: number[];
+  let dev2: number;
+  let finalJitter = 0;
+  if (jc === undefined) {
+    const sol = optimalTimes(packets, finalOrder, windows, finalGaps, minInterval, maxInterval);
+    finalTimes = sol.times;
+    dev2 = sol.deviation2;
+  } else {
+    const sol = optimalTimesBudgeted(
+      packets,
+      finalOrder,
+      windows,
+      finalGaps,
+      minInterval,
+      maxInterval,
+      jc.nominalInterval,
+      jc.totalJitterBudget,
+    );
+    if (sol === null) {
+      throw new SolveError(
+        'NO_CONSISTENT_INTERPRETATION',
+        'internal failure: certified chain does not admit a budgeted timestamp vector',
+      );
+    }
+    finalTimes = sol.times;
+    dev2 = sol.deviation2;
+    finalJitter = sol.jitter;
+  }
   let gapSum = 0;
   for (const d of finalGaps) gapSum += d;
 
@@ -880,14 +1304,16 @@ export function solve(
     {
       gapSum,
       deviation2: dev2,
-      times,
+      times: finalTimes,
       order: finalOrder,
-      c0: curC0lo,
+      c0: finalC0,
       gaps: finalGaps,
     },
     modulus,
     minInterval,
     maxInterval,
+    jc,
+    finalJitter,
   );
 }
 
@@ -897,6 +1323,8 @@ function buildResult(
   modulus: number,
   minInterval: number,
   maxInterval: number,
+  jc: JitterConfig | undefined,
+  totalJitter: number,
 ): SolveResult {
   const n = cand.order.length;
   const order = cand.order.map((ix) => packets[ix].id);
@@ -905,6 +1333,7 @@ function buildResult(
   const missingSegments: MissingSegment[] = [];
 
   let count = cand.c0;
+  let cumulative = 0;
   for (let k = 0; k < n; k++) {
     const p = packets[cand.order[k]];
     assignments.push({
@@ -923,6 +1352,13 @@ function buildResult(
       }
       const tGap = cand.times[k] - cand.times[k - 1];
       const prevP = packets[cand.order[k - 1]];
+      let nominalGap: number | undefined;
+      let jitter: number | undefined;
+      if (jc !== undefined) {
+        nominalGap = d * jc.nominalInterval;
+        jitter = Math.abs(tGap - nominalGap);
+        cumulative += jitter;
+      }
       adjacency.push({
         index: k - 1,
         fromId: prevP.id,
@@ -934,6 +1370,13 @@ function buildResult(
         toTime: cand.times[k],
         timeGap: tGap,
         allowedTimeGap: { min: d * minInterval, max: d * maxInterval },
+        ...(jc !== undefined
+          ? {
+              nominalTimeGap: nominalGap!,
+              jitter: jitter!,
+              cumulativeJitter: cumulative,
+            }
+          : {}),
         missingBetween: d - 1,
         congruence: { remainder: p.remainder, modulus },
         absoluteCountCongruent: modNonNeg(count, modulus) === p.remainder,
@@ -962,6 +1405,17 @@ function buildResult(
     missingCountTotal: cand.gapSum - (n - 1),
     adjacency,
     observedCountRange: { first: cand.c0, last: cand.c0 + cand.gapSum },
+    ...(jc !== undefined
+      ? {
+          jitterBudget: {
+            nominalInterval: jc.nominalInterval,
+            budget: jc.totalJitterBudget,
+            used: totalJitter,
+            remaining: jc.totalJitterBudget - totalJitter,
+            exhausted: totalJitter === jc.totalJitterBudget,
+          },
+        }
+      : {}),
   };
 }
 
@@ -973,6 +1427,7 @@ function buildFailureEvidence(
   countUpper: number,
   minInterval: number,
   maxInterval: number,
+  jc?: JitterConfig,
 ): SolveError {
   const make = (evidence: ConstraintFailureEvidence): SolveError =>
     new SolveError(
@@ -992,10 +1447,80 @@ function buildFailureEvidence(
   }
 
   const n = packets.length;
-  const { depth, placed, last, S, c0lo, c0hi, tLo, tHi } = bestDead;
+  const { depth, placed, last, S, c0lo, c0hi, tLo, tHi, gaps: deadGaps, jitterLB } = bestDead;
   const partialOrder = placed.map((ix) => packets[ix].id);
   const usedNow = new Set(placed);
   const slotsAfter = n - 1 - depth;
+
+  // Complete chain whose every structural constraint holds but whose exact
+  // minimum cumulative jitter exceeds the budget: report the shortfall.
+  if (jc !== undefined && depth === n) {
+    const windows = tightenWindows(packets, placed, deadGaps, minInterval, maxInterval);
+    let jMin = Number.isFinite(jitterLB) ? jitterLB : Infinity;
+    if (windows !== null) {
+      const cands = jitterCandidates(
+        packets, placed, windows, deadGaps, minInterval, maxInterval, jc.nominalInterval,
+      );
+      const v = minChainJitter(cands, deadGaps, minInterval, maxInterval, jc.nominalInterval);
+      if (Number.isFinite(v)) jMin = v;
+    }
+    if (Number.isFinite(jMin) && jMin > jc.totalJitterBudget) {
+      const lastP = packets[last];
+      return make({
+        stage: 'extension',
+        partialLength: depth,
+        partialOrder,
+        candidateId: lastP.id,
+        reason:
+          `cannot interpret the complete order ${partialOrder.map(String).join(' -> ')} within the ` +
+          `cumulative jitter budget: the fixed order and absolute counts force a minimum total ` +
+          `jitter of ${jMin}, which exceeds the budget ${jc.totalJitterBudget} by ` +
+          `${jMin - jc.totalJitterBudget} (nominal interval ${jc.nominalInterval})`,
+        detail: {
+          cause: 'JITTER_BUDGET',
+          jitter: {
+            nominalInterval: jc.nominalInterval,
+            budget: jc.totalJitterBudget,
+            used: jMin,
+            minimumAdditional: jMin - jc.totalJitterBudget,
+          },
+        },
+      });
+    }
+  }
+
+  // Forced jitter of the fixed partial order, needed to report cumulative
+  // budget usage at the dead end. Reconstruct the FORWARD-tightened per-node
+  // windows exactly as the search carried them (the dead frontier tLo/tHi is
+  // such a forward window), then sum each edge's forced-jitter lower bound.
+  let prefixJitterUsed = 0;
+  if (jc !== undefined && placed.length > 0) {
+    const fw: { lo: number; hi: number }[] = [];
+    for (let k = 0; k < placed.length; k++) {
+      const pp = packets[placed[k]];
+      if (k === 0) fw.push({ lo: pp.lo, hi: pp.hi });
+      else {
+        const dd = deadGaps[k - 1];
+        fw.push({
+          lo: Math.max(pp.lo, fw[k - 1].lo + dd * minInterval),
+          hi: Math.min(pp.hi, fw[k - 1].hi + dd * maxInterval),
+        });
+      }
+    }
+    for (let k = 0; k < deadGaps.length; k++) {
+      prefixJitterUsed += edgeJitterLowerBound(
+        deadGaps[k],
+        fw[k].lo,
+        fw[k].hi,
+        fw[k + 1].lo,
+        fw[k + 1].hi,
+        minInterval,
+        maxInterval,
+        jc.nominalInterval,
+      );
+    }
+    if (!Number.isFinite(prefixJitterUsed)) prefixJitterUsed = Number.isFinite(jitterLB) ? jitterLB : 0;
+  }
 
   // Reproduce the canonical successor scan at the deepest dead end. For each
   // unused successor derive the feasible counter-gap range implied by each
@@ -1007,13 +1532,17 @@ function buildFailureEvidence(
   // the first blocker in canonical order (cause, gap, id) is reported.
   type Blocker = {
     j: number;
-    cause: 'TIME_GAP' | 'COUNT_WINDOW' | 'CONGRUENCE';
+    cause: 'TIME_GAP' | 'COUNT_WINDOW' | 'CONGRUENCE' | 'JITTER_BUDGET';
     dStar: number;
     delta: number;
     timeRange: { min: number; max: number };
     countRange: { min: number; max: number };
     intrinsicCeiling: number;
     achievable: { min: number; max: number };
+    /** Smallest forced edge jitter across this successor's admissible gaps. */
+    minEdgeJitter: number;
+    /** Congruent gap attaining minEdgeJitter. */
+    minEdgeGap: number;
   };
   const blockers: Blocker[] = [];
 
@@ -1046,10 +1575,45 @@ function buildFailureEvidence(
     const dCount = snapOrInf(Math.max(d0, Clo), Chi);
     const dBoth = snapOrInf(loAll, hiAll);
 
+    // Enumerate every congruent gap admissible by time+count windows and the
+    // raw feasibility test, tracking the smallest forced next-edge jitter.
+    let minEdgeJitter = Infinity;
+    let minEdgeGap = Infinity;
+    if (jc !== undefined && dBoth !== Infinity) {
+      for (let d = dBoth; d <= hiAll; d += modulus) {
+        if (d * minInterval > pj.hi - tLo) break;
+        const njLo = Math.max(c0lo, pj.baseCount - S - d);
+        const njHi = Math.min(c0hi, pj.topCount - S - d, countUpper - slotsAfter - S - d);
+        const ntLo = Math.max(pj.lo, tLo + d * minInterval);
+        const ntHi = Math.min(pj.hi, tHi + d * maxInterval);
+        if (njLo > njHi || ntLo > ntHi) continue;
+        const forced = edgeJitterLowerBound(
+          d, tLo, tHi, ntLo, ntHi, minInterval, maxInterval, jc.nominalInterval,
+        );
+        if (forced < minEdgeJitter) {
+          minEdgeJitter = forced;
+          minEdgeGap = d;
+        }
+      }
+    }
+
+    const budgetBlocks =
+      jc !== undefined &&
+      dBoth !== Infinity &&
+      Number.isFinite(minEdgeJitter) &&
+      prefixJitterUsed + minEdgeJitter > jc.totalJitterBudget;
+
     let cause: Blocker['cause'];
     let dStar: number;
-    if (dBoth !== Infinity) continue; // extendable; cannot occur at a dead end
-    if (dCount !== Infinity) {
+    if (budgetBlocks) {
+      // Time/count/congruence all admit a gap; only the jitter budget fails.
+      cause = 'JITTER_BUDGET';
+      dStar = minEdgeGap;
+    } else if (dBoth !== Infinity) {
+      // This successor itself looks extendable; it cannot be the reported
+      // blocker of the dead end (a later extension or the leaf budget fails).
+      continue;
+    } else if (dCount !== Infinity) {
       // The smallest gap satisfying congruence + the count window exists;
       // the extension attempt at it fails on the time-difference range.
       cause = 'TIME_GAP';
@@ -1073,10 +1637,12 @@ function buildFailureEvidence(
       countRange: { min: Clo, max: Chi },
       intrinsicCeiling: pf.dHi,
       achievable: { min: pj.lo - tHi, max: pj.hi - tLo },
+      minEdgeJitter: Number.isFinite(minEdgeJitter) ? minEdgeJitter : Infinity,
+      minEdgeGap: Number.isFinite(minEdgeGap) ? minEdgeGap : Infinity,
     });
   }
 
-  const causeRank = { TIME_GAP: 0, COUNT_WINDOW: 1, CONGRUENCE: 2 } as const;
+  const causeRank = { TIME_GAP: 0, COUNT_WINDOW: 1, CONGRUENCE: 2, JITTER_BUDGET: 3 } as const;
   blockers.sort(
     (a, b) =>
       causeRank[a.cause] - causeRank[b.cause] ||
@@ -1090,6 +1656,36 @@ function buildFailureEvidence(
     const prevId = String(packets[last].id);
     const finite = (x: number): number => (Number.isFinite(x) ? x : -1);
     const d = b.dStar;
+
+    if (b.cause === 'JITTER_BUDGET') {
+      const minAdd = b.minEdgeJitter;
+      return make({
+        stage: 'extension',
+        partialLength: depth,
+        partialOrder,
+        candidateId: pj.id,
+        reason:
+          `cannot append packet ${String(pj.id)} after packet ${prevId} within the cumulative ` +
+          `jitter budget: the fixed partial order has already forced ${prefixJitterUsed} of the ` +
+          `${jc!.totalJitterBudget} budget, and every otherwise admissible congruent gap for this ` +
+          `packet adds at least ${minAdd} more jitter (first reached at gap ${finite(b.minEdgeGap)}), ` +
+          `so ${prefixJitterUsed + minAdd} > ${jc!.totalJitterBudget}; nominal interval ` +
+          `${jc!.nominalInterval} (time/count/congruence constraints all admit the extension)`,
+        detail: {
+          cause: 'JITTER_BUDGET',
+          minimalCongruentGap: Number.isFinite(b.minEdgeGap) ? b.minEdgeGap : undefined,
+          countGap: Number.isFinite(b.minEdgeGap) ? b.minEdgeGap : undefined,
+          countGapWindow: { min: b.countRange.min, max: b.countRange.max },
+          actualTimeGapRange: b.achievable,
+          jitter: {
+            nominalInterval: jc!.nominalInterval,
+            budget: jc!.totalJitterBudget,
+            used: prefixJitterUsed,
+            minimumAdditional: minAdd,
+          },
+        },
+      });
+    }
 
     if (b.cause === 'TIME_GAP') {
       // Smallest congruent gap that would satisfy the time-difference range.

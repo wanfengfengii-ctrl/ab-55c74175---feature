@@ -20,6 +20,19 @@
 全局参数：`modulus`（模数/轮转周期）、`countLower`/`countUpper`（绝对计数搜索窗）、
 `minInterval`/`maxInterval`（相邻采样间隔上下限）。
 
+可选参数（成对出现）：`nominalInterval`（标称节拍）与 `totalJitterBudget`（累计抖动预算）。
+`nominalInterval` 必须是满足 `minInterval ≤ nominalInterval ≤ maxInterval` 的整数，
+`totalJitterBudget` 为非负整数。两者同时缺省时，请求、响应与三级裁决与不启用预算时
+完全一致。启用后，对复原次序中每对相邻已观测包定义该边抖动
+
+```
+jitter_i = |(t_{i+1} - t_i) - (c_{i+1} - c_i) * nominalInterval|
+```
+
+并要求所有边抖动之和 `Σ jitter_i ≤ totalJitterBudget`（恰好耗尽也可接受）。该约束
+**与发送次序、跨周绝对计数、整数时刻联合求解**，而不是先求原最优解再事后过滤：
+预算吃紧时，求解器会改选缺包略多但抖动达标的整体解释。
+
 服务为每包联合选择：
 
 1. 互不相同、严格递增、落在搜索窗内且与其余数**同余**的绝对计数 `c_i`；
@@ -111,12 +124,45 @@ d * minInterval ≤ t_j - t_i ≤ d * maxInterval,   d = c_j - c_i ≥ 1
 }
 ```
 
+启用预算时，请求可附带 `"nominalInterval": 10, "totalJitterBudget": 0`，响应在
+每条相邻证据中额外给出：
+
+```json
+{
+  "nominalTimeGap": 10,
+  "jitter": 0,
+  "cumulativeJitter": 0
+}
+```
+
+其中 `nominalTimeGap = countGap * nominalInterval`，`jitter` 为该边偏差，
+`cumulativeJitter` 为到该边为止（含）的累计抖动；并在 `data.jitterBudget` 汇总
+
+```json
+{
+  "nominalInterval": 10,
+  "budget": 0,
+  "used": 0,
+  "remaining": 0,
+  "exhausted": true
+}
+```
+
+预算恰好耗尽（`used === budget`，`exhausted: true`）仍返回 200。未启用预算时
+以上字段全部缺省。
+
 错误：
 
 | HTTP | error.code | 含义 |
 | --- | --- | --- |
-| 400 | `INVALID_REQUEST` | 请求结构/取值非法 |
+| 400 | `INVALID_REQUEST` | 请求结构/取值非法（含只给一个预算参数、`nominalInterval` 越界、预算为负） |
 | 422 | `NO_CONSISTENT_INTERPRETATION` | 搜索窗内无整体一致解释（附首个阻断约束证据） |
+
+当时间、计数、同余约束均可满足、仅累计抖动无法延伸时，仍返回 422
+`NO_CONSISTENT_INTERPRETATION`，其首个阻断证据的 `detail.cause` 为 `JITTER_BUDGET`，
+并在 `detail.jitter` 标明该部分次序**已用量** `used`、延伸该包所需的**最低新增量**
+`minimumAdditional` 与 `budget` 上限；若整条次序都已确定却只在最后超出预算，
+`partialLength` 为包数，证据仍给出相同的三项数值。
 
 ## 算法概述
 
@@ -129,6 +175,11 @@ d * minInterval ≤ t_j - t_i ≤ d * maxInterval,   d = c_j - c_i ≥ 1
 - **时刻优化**：固定次序与计数差后，这是路径差分约束上的整数 L1 问题；通过
   "枢轴值 × 任意上下限紧约束链"枚举候选值，再以滑动窗口最短路 DP 精确求解，
   并重建字典序最小时刻向量。
+- **累计抖动预算（可选）**：预算随搜索下推，以"已固定前缀的强制抖动下界"在
+  分支限界中剪枝，叶子用精确的固定链最小抖动 DP 判定（滑动窗口双端队列最小化
+  `Σ |(Δt) − d·nominal|`）；时刻优化在预算约束下改为帕累托标签 DP，候选值由
+  区间/中点枢轴沿零抖动与上下限紧链传播、再叠加预算走廊精确张成，因此预算与
+  次序、绝对计数、整数时刻始终联合求解。
 
 ## 本地开发
 

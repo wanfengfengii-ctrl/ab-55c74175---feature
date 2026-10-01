@@ -63,6 +63,39 @@ export function validateRequest(raw: unknown): SolveRequest {
     );
   }
 
+  // Optional cumulative-jitter constraint: nominalInterval and
+  // totalJitterBudget are an all-or-nothing pair. When both are absent the
+  // request behaves exactly as the budget-free API.
+  const hasNominal = obj.nominalInterval !== undefined;
+  const hasBudget = obj.totalJitterBudget !== undefined;
+  let nominalInterval: number | undefined;
+  let totalJitterBudget: number | undefined;
+  if (hasNominal !== hasBudget) {
+    throw new SolveError(
+      'INVALID_REQUEST',
+      'fields "nominalInterval" and "totalJitterBudget" must be provided together',
+    );
+  }
+  if (hasNominal && hasBudget) {
+    if (!isSafeInt(obj.nominalInterval) || !isSafeInt(obj.totalJitterBudget)) {
+      throw new SolveError(
+        'INVALID_REQUEST',
+        'fields "nominalInterval" and "totalJitterBudget" must be safe integers',
+      );
+    }
+    nominalInterval = obj.nominalInterval as number;
+    totalJitterBudget = obj.totalJitterBudget as number;
+    if (nominalInterval < minInterval || nominalInterval > maxInterval) {
+      throw new SolveError(
+        'INVALID_REQUEST',
+        'nominalInterval must satisfy minInterval <= nominalInterval <= maxInterval',
+      );
+    }
+    if (totalJitterBudget < 0) {
+      throw new SolveError('INVALID_REQUEST', 'totalJitterBudget must be a non-negative integer');
+    }
+  }
+
   if (!Array.isArray(obj.packets)) {
     throw new SolveError('INVALID_REQUEST', 'field "packets" must be an array');
   }
@@ -127,5 +160,14 @@ export function validateRequest(raw: unknown): SolveRequest {
     return { id: po.id as string | number, remainder, timeLower, timeUpper };
   });
 
-  return { packets, modulus, countLower, countUpper, minInterval, maxInterval };
+  return {
+    packets,
+    modulus,
+    countLower,
+    countUpper,
+    minInterval,
+    maxInterval,
+    nominalInterval,
+    totalJitterBudget,
+  };
 }
