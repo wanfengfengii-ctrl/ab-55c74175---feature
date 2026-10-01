@@ -31,6 +31,10 @@ export function handleSolve(rawBody: unknown): ApiResponse | ApiError {
       req.countUpper,
       req.minInterval,
       req.maxInterval,
+      {
+        nominalInterval: req.nominalInterval,
+        totalJitterBudget: req.totalJitterBudget,
+      },
     );
     return { status: 'ok', data: result };
   } catch (err) {

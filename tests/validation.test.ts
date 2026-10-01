@@ -77,4 +77,61 @@ describe('validateRequest', () => {
     b.countUpper = b.countLower + 2_000_000;
     expect(() => validateRequest(b)).toThrow(SolveError);
   });
+
+  describe('jitter budget parameters', () => {
+    it('accepts both parameters with nominalInterval inside the sampling range', () => {
+      const b = valid();
+      b.nominalInterval = 10;
+      b.totalJitterBudget = 0;
+      const req = validateRequest(b);
+      expect(req.nominalInterval).toBe(10);
+      expect(req.totalJitterBudget).toBe(0);
+    });
+
+    it('leaves both parameters undefined when absent (full backward compatibility)', () => {
+      const req = validateRequest(valid());
+      expect(req.nominalInterval).toBeUndefined();
+      expect(req.totalJitterBudget).toBeUndefined();
+    });
+
+    it.each([
+      ['nominalInterval only', { nominalInterval: 10 }],
+      ['totalJitterBudget only', { totalJitterBudget: 5 }],
+    ])('rejects %s', (_label, extra) => {
+      const b = { ...valid(), ...extra };
+      try {
+        validateRequest(b);
+        throw new Error('should have thrown');
+      } catch (e) {
+        expect((e as SolveError).code).toBe('INVALID_REQUEST');
+      }
+    });
+
+    it('rejects non-integer nominalInterval or totalJitterBudget', () => {
+      expect(() => validateRequest({ ...valid(), nominalInterval: 9.5, totalJitterBudget: 5 })).toThrow(SolveError);
+      expect(() => validateRequest({ ...valid(), nominalInterval: 10, totalJitterBudget: -1 })).toThrow(SolveError);
+    });
+
+    it('rejects nominalInterval outside [minInterval, maxInterval]', () => {
+      const below = valid();
+      below.nominalInterval = 8;
+      below.totalJitterBudget = 5;
+      expect(() => validateRequest(below)).toThrow(SolveError);
+      const above = valid();
+      above.nominalInterval = 12;
+      above.totalJitterBudget = 5;
+      expect(() => validateRequest(above)).toThrow(SolveError);
+    });
+
+    it('accepts nominalInterval exactly at either sampling bound', () => {
+      const lo = valid();
+      lo.nominalInterval = 9;
+      lo.totalJitterBudget = 0;
+      expect(() => validateRequest(lo)).not.toThrow();
+      const hi = valid();
+      hi.nominalInterval = 11;
+      hi.totalJitterBudget = 0;
+      expect(() => validateRequest(hi)).not.toThrow();
+    });
+  });
 });

@@ -46,6 +46,41 @@ export function validateRequest(raw: unknown): SolveRequest {
       'maxInterval must not exceed 1,000,000 to keep gap products integral',
     );
   }
+
+  // Optional cumulative jitter budget: both parameters are a single feature
+  // switch, so they must be supplied together. A half-specified request is a
+  // validation error rather than a silently budget-less recovery.
+  const hasNominal = Object.prototype.hasOwnProperty.call(obj, 'nominalInterval') &&
+    obj.nominalInterval !== undefined;
+  const hasBudget = Object.prototype.hasOwnProperty.call(obj, 'totalJitterBudget') &&
+    obj.totalJitterBudget !== undefined;
+  let nominalInterval: number | undefined;
+  let totalJitterBudget: number | undefined;
+  if (hasNominal || hasBudget) {
+    if (!hasNominal || !hasBudget) {
+      throw new SolveError(
+        'INVALID_REQUEST',
+        'nominalInterval and totalJitterBudget must be supplied together',
+      );
+    }
+    if (!isSafeInt(obj.nominalInterval)) {
+      throw new SolveError('INVALID_REQUEST', 'field "nominalInterval" must be a safe integer');
+    }
+    if (!isSafeInt(obj.totalJitterBudget)) {
+      throw new SolveError('INVALID_REQUEST', 'field "totalJitterBudget" must be a safe integer');
+    }
+    nominalInterval = obj.nominalInterval as number;
+    totalJitterBudget = obj.totalJitterBudget as number;
+    if (nominalInterval < minInterval || nominalInterval > maxInterval) {
+      throw new SolveError(
+        'INVALID_REQUEST',
+        'nominalInterval must satisfy minInterval <= nominalInterval <= maxInterval',
+      );
+    }
+    if (totalJitterBudget < 0) {
+      throw new SolveError('INVALID_REQUEST', 'totalJitterBudget must be a non-negative integer');
+    }
+  }
   // Guard against silent precision loss when multiplying the window width
   // by the largest interval, and against time coordinates that cannot be
   // combined exactly with gap products.
@@ -127,5 +162,14 @@ export function validateRequest(raw: unknown): SolveRequest {
     return { id: po.id as string | number, remainder, timeLower, timeUpper };
   });
 
-  return { packets, modulus, countLower, countUpper, minInterval, maxInterval };
+  return {
+    packets,
+    modulus,
+    countLower,
+    countUpper,
+    minInterval,
+    maxInterval,
+    nominalInterval,
+    totalJitterBudget,
+  };
 }

@@ -20,6 +20,12 @@
 全局参数：`modulus`（模数/轮转周期）、`countLower`/`countUpper`（绝对计数搜索窗）、
 `minInterval`/`maxInterval`（相邻采样间隔上下限）。
 
+可选参数 `nominalInterval` 与 `totalJitterBudget`（必须同时提供）启用**累计抖动预算**：
+`nominalInterval` 必须落在 `[minInterval, maxInterval]` 内；对复原次序中每对相邻已观测包
+`(i, j)` 定义抖动 `|t_j − t_i − (c_j − c_i)·nominalInterval|`，全部相邻包的抖动之和不得超过
+`totalJitterBudget`。该约束与发送次序、跨周绝对计数、整数时刻**联合求解**（而非先取无约束
+最优再过滤）；预算恰好耗尽仍视为可行。
+
 服务为每包联合选择：
 
 1. 互不相同、严格递增、落在搜索窗内且与其余数**同余**的绝对计数 `c_i`；
@@ -115,8 +121,27 @@ d * minInterval ≤ t_j - t_i ≤ d * maxInterval,   d = c_j - c_i ≥ 1
 
 | HTTP | error.code | 含义 |
 | --- | --- | --- |
-| 400 | `INVALID_REQUEST` | 请求结构/取值非法 |
+| 400 | `INVALID_REQUEST` | 请求结构/取值非法（含两个抖动参数只给一个、`nominalInterval` 越界） |
 | 422 | `NO_CONSISTENT_INTERPRETATION` | 搜索窗内无整体一致解释（附首个阻断约束证据） |
+
+启用抖动预算时，成功响应的每条 `adjacency` 证据额外给出 `nominalTimeGap`
+（`countGap * nominalInterval`）、`jitter`（该相邻对偏差）与 `cumulativeJitter`
+（截至该相邻对的累计消耗），并在顶层汇总 `jitter`：
+
+```json
+"jitter": {
+  "nominalInterval": 10,
+  "budget": 0,
+  "used": 0,
+  "remaining": 0,
+  "exhausted": true
+}
+```
+
+若**仅**因累计抖动无法延伸（次序/计数/时刻本身一致），同样返回
+`NO_CONSISTENT_INTERPRETATION`，其首个阻断证据 `detail.cause` 为 `JITTER_BUDGET`，并标明
+`used`（已用量）、`minAdditionalJitter`（最低新增量）、`budget`（预算上限）及
+`minimalByGap`（每个仍可取的同余计数差所需的最低新增抖动）。
 
 ## 算法概述
 
@@ -128,7 +153,9 @@ d * minInterval ≤ t_j - t_i ≤ d * maxInterval,   d = c_j - c_i ≥ 1
   C 用记忆化可行性判定贪心固定每一位最小编号。
 - **时刻优化**：固定次序与计数差后，这是路径差分约束上的整数 L1 问题；通过
   "枢轴值 × 任意上下限紧约束链"枚举候选值，再以滑动窗口最短路 DP 精确求解，
-  并重建字典序最小时刻向量。
+  并重建字典序最小时刻向量。启用累计抖动预算时，全局预算线性约束至多允许一条
+  "残差边"，据此把候选枚举扩展为紧约束链闭包 + 按边抖动选项的子集和展开，再以
+  (时刻, 已用抖动) 二维 DP 联合求解并在每个搜索阶段内联剪枝。
 
 ## 本地开发
 
@@ -137,7 +164,7 @@ d * minInterval ≤ t_j - t_i ≤ d * maxInterval,   d = c_j - c_i ≥ 1
 ```bash
 npm ci
 npm run typecheck   # tsc --noEmit
-npm test            # vitest：单元测试 + 360 随机对拍穷举参考 + 2000 例时刻DP对拍
+npm test            # vitest：单元测试 + 随机对拍穷举参考（含抖动预算）+ 时刻DP对拍（含二维预算DP）
 npm run build       # 输出 dist/
 npm start           # 默认 0.0.0.0:3000
 API_PORT=8080 npm start

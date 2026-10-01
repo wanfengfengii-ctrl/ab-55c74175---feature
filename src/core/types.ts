@@ -39,6 +39,18 @@ export interface SolveRequest {
   minInterval: number;
   /** Maximum interval (inclusive) between adjacent samples. */
   maxInterval: number;
+  /**
+   * Nominal per-counter tick interval, optional. When present,
+   * totalJitterBudget must be present too; required to satisfy
+   * minInterval <= nominalInterval <= maxInterval.
+   */
+  nominalInterval?: number;
+  /**
+   * Inclusive cumulative jitter budget, optional. For every adjacent pair of
+   * observed packets the jitter is |timeGap - countGap * nominalInterval|;
+   * the sum over all adjacencies must not exceed this budget.
+   */
+  totalJitterBudget?: number;
 }
 
 /** Per-adjacent-pair constraint check evidence. */
@@ -57,6 +69,21 @@ export interface AdjacencyEvidence {
   timeGap: number;
   /** Inclusive feasible time-difference range for this counter gap. */
   allowedTimeGap: { min: number; max: number };
+  /**
+   * Nominal time difference countGap * nominalInterval; present only when a
+   * jitter budget was supplied with the request.
+   */
+  nominalTimeGap?: number;
+  /**
+   * |timeGap - nominalTimeGap| for this adjacency; present only with an
+   * active jitter budget.
+   */
+  jitter?: number;
+  /**
+   * Cumulative jitter consumed on adjacencies 0..index (inclusive); present
+   * only with an active jitter budget.
+   */
+  cumulativeJitter?: number;
   /** Number of unobserved absolute counters strictly between the pair. */
   missingBetween: number;
   /** Congruence note for the destination packet. */
@@ -99,6 +126,20 @@ export interface SolveResult {
   adjacency: AdjacencyEvidence[];
   /** Counts of the first/last observed packets. */
   observedCountRange: { first: number; last: number };
+  /**
+   * Jitter budget accounting; present only when nominalInterval and
+   * totalJitterBudget were supplied.
+   */
+  jitter?: {
+    nominalInterval: number;
+    budget: number;
+    /** Sum of per-adjacency jitter; always <= budget (budget may be unused). */
+    used: number;
+    /** Budget still available after the last adjacency (budget - used). */
+    remaining: number;
+    /** True exactly when the whole budget was consumed (used === budget). */
+    exhausted: boolean;
+  };
 }
 
 /** Stable business error codes. */
@@ -127,7 +168,7 @@ export interface ConstraintFailureEvidence {
    */
   detail?: {
     /** Which constraint class prevents the extension. */
-    cause: 'TIME_GAP' | 'COUNT_WINDOW' | 'CONGRUENCE';
+    cause: 'TIME_GAP' | 'COUNT_WINDOW' | 'CONGRUENCE' | 'JITTER_BUDGET';
     /** Smallest congruent counter gap considered. */
     minimalCongruentGap?: number;
     countGap?: number;
@@ -135,6 +176,24 @@ export interface ConstraintFailureEvidence {
     actualTimeGapRange?: { min: number; max: number };
     /** Residual gap range allowed by the absolute-count search window. */
     countGapWindow?: { min: number; max: number };
+    /**
+     * Jitter-budget blocker detail (cause === 'JITTER_BUDGET'): every
+     * otherwise-consistent extension needs at least `minAdditionalJitter`
+     * fresh jitter but only `budget - jitterUsed` remains.
+     */
+    jitterBudget?: {
+      nominalInterval: number;
+      budget: number;
+      used: number;
+      remaining: number;
+      minAdditionalJitter: number;
+      /**
+       * Smallest jitter attainable for this edge, per possible congruent
+       * counter gap (gap -> minimum edge jitter over integer timestamps),
+       * restricted to gaps that respect all other constraints.
+       */
+      minimalByGap: { countGap: number; minEdgeJitter: number }[];
+    };
   };
 }
 

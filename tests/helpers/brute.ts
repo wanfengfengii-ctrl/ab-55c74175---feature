@@ -3,7 +3,13 @@ import type { PacketInput } from '../../src/core/types.js';
 export interface RefSolution {
   missing: number;
   deviation: number;
+  jitter: number;
   idSeq: (string | number)[];
+}
+
+export interface BruteOptions {
+  nominalInterval?: number;
+  totalJitterBudget?: number;
 }
 
 export function lexIds(a: (string | number)[], b: (string | number)[]): number {
@@ -23,7 +29,9 @@ export function lexIds(a: (string | number)[], b: (string | number)[]): number {
  * Independent exhaustive reference with deliberately simple, separate logic:
  * every packet order, then every strictly increasing congruent count
  * assignment, then every integer timestamp in each closed interval, with
- * adjacency bounds pruned inline. Returns the lexicographically optimal
+ * adjacency bounds pruned inline. When a jitter budget is supplied it is
+ * enforced as a hard, joint constraint during enumeration — never as a
+ * post-filter. Returns the lexicographically optimal
  * (missing, deviation, id sequence) tuple or null when nothing is feasible.
  */
 export function bruteSolve(
@@ -33,9 +41,13 @@ export function bruteSolve(
   countUpper: number,
   minInterval: number,
   maxInterval: number,
+  options: BruteOptions = {},
 ): RefSolution | null {
   const n = packets.length;
   const mod = (a: number): number => ((a % modulus) + modulus) % modulus;
+  const jitterOn = options.nominalInterval !== undefined && options.totalJitterBudget !== undefined;
+  const nominal = options.nominalInterval ?? 0;
+  const budget = options.totalJitterBudget ?? 0;
   let best: RefSolution | null = null;
 
   const order: number[] = [];
@@ -45,7 +57,13 @@ export function bruteSolve(
 
   const considerLeaf = (): void => {
     let gapSum = 0;
-    for (let k = 1; k < n; k++) gapSum += counts[k] - counts[k - 1];
+    let jitter = 0;
+    for (let k = 1; k < n; k++) {
+      const d = counts[k] - counts[k - 1];
+      gapSum += d;
+      if (jitterOn) jitter += Math.abs(times[k] - times[k - 1] - d * nominal);
+    }
+    if (jitterOn && jitter > budget) return;
     let dev = 0;
     for (let k = 0; k < n; k++) {
       const p = packets[order[k]];
@@ -54,6 +72,7 @@ export function bruteSolve(
     const cand: RefSolution = {
       missing: gapSum - (n - 1),
       deviation: dev,
+      jitter,
       idSeq: order.map((ix) => packets[ix].id),
     };
     if (
@@ -64,6 +83,15 @@ export function bruteSolve(
           (cand.deviation === best.deviation && lexIds(cand.idSeq, best.idSeq) < 0)))
     ) {
       best = cand;
+    } else if (
+      cand.missing === best.missing &&
+      cand.deviation === best.deviation &&
+      lexIds(cand.idSeq, best.idSeq) === 0 &&
+      cand.jitter < best.jitter
+    ) {
+      // Equal primary tuple: the solver's secondary tie-break keeps the
+      // smallest achievable jitter, so track that minimum too.
+      best.jitter = cand.jitter;
     }
   };
 
@@ -75,6 +103,17 @@ export function bruteSolve(
         const d = counts[k] - counts[k - 1];
         const g = t - times[k - 1];
         if (g < d * minInterval || g > d * maxInterval) continue;
+        if (jitterOn) {
+          // Prefix jitter is non-decreasing along the chain; times[0..k-1]
+          // are fixed, add the tentative new edge exactly once.
+          let prefixJitter = 0;
+          for (let e = 1; e < k; e++) {
+            const de = counts[e] - counts[e - 1];
+            prefixJitter += Math.abs(times[e] - times[e - 1] - de * nominal);
+          }
+          prefixJitter += Math.abs(t - times[k - 1] - d * nominal);
+          if (prefixJitter > budget) continue;
+        }
       }
       times[k] = t;
       if (k === n - 1) considerLeaf();
